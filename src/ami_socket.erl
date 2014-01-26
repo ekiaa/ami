@@ -9,7 +9,7 @@
 
 -behaviour(gen_server).
 
--include("log.hrl").
+-include("ami.hrl").
 
 %% API functions
 
@@ -39,14 +39,10 @@ stop() ->
 	gen_server:call(?MODULE, stop).
 
 connect() ->
-	Host = application:get_env(ami_host),
-	Port = application:get_env(ami_port),
-	% User = application:get_env(ami_user),
-	% Pass = application:get_env(ami_pass),
-	if 
-		Host /= undefined and Port /= undefined ->
+	case {application:get_env(ami, ami_host), application:get_env(ami, ami_port)} of
+		{{ok, Host}, {ok, Port}} ->
 			gen_server:call(?MODULE, {connect, Host, Port});
-		true ->
+		_ ->
 			{error, <<"No host or port are specified">>}
 	end.
 
@@ -60,7 +56,7 @@ connect() ->
 %%--------------------------------------------------------------------
 
 init([]) ->
-	gen_server:cast(self(), init),
+	lager:debug("init"),
 	{ok, #state{}};
 
 init(Args) ->
@@ -103,9 +99,17 @@ handle_cast(Message, State) ->
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
 
+handle_info({tcp, Socket, <<"Asterisk Call Manager/2.0.0\r\n">>}, State) when ?State.socket == Socket ->
+	lager:debug("connect to Asterisk Call Manager 2.0.0 success"),
+	{noreply, State};
+
+handle_info({tcp_closed, Socket}, State) when ?State.socket == Socket ->
+	lager:debug("socket ~p closed", [Socket]),
+	{noreply, ?State{socket = undefined}};
+
 handle_info(Info, State) ->
 	lager:error("handle_info: nomatch Info: ~p", [Info]),
-	{stop, {error, nomatch}, State}.
+	{noreply, State}.
 
 %%--------------------------------------------------------------------
 %% Function: terminate(Reason, State) -> void()
