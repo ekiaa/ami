@@ -1,0 +1,10 @@
+{application, ami, [
+	{description, "Erlang AMI Asterisk Driver"},
+	{vsn, "0.1"},
+	{registered, []},
+	{applications, [
+		kernel,
+		stdlib]},
+	{mod, { ami_app, []}},
+	{env, []}
+]}.
