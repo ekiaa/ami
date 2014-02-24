@@ -59,7 +59,8 @@ init([]) ->
 		socket => undefined,
 		status => ok,
 		key    => <<>>,
-		msg    => #{event => <<>>, params => undefined},
+		value  => <<>>,
+		list   => [],
 		result => undefined,
 		buf    => <<>>}};
 
@@ -110,13 +111,20 @@ handle_cast(Message, State) ->
 handle_info({tcp, Socket, Data}, #{socket := Socket, buf := Buf} = State)->
 	try
 		lager:debug("recieve tcp data:~n~p", [Data]),
-		case decode(State#{buf => <<Buf/binary, Data/binary>>}) of
-			#{status := ok, result := Msg} = NewState ->
-				io:format("decode result:~n~p~n", [Msg]),
+		NewState = decode(State#{buf => <<Buf/binary, Data/binary>>}),
+		case NewState of
+			#{status := ok, result := #{<<"Event">> := <<"SuccessfulConnect">>} = Map}  ->
+				String = map_to_string(Map),
+				lager:debug("~s", [String]),
 				{noreply, NewState};
-			Nomatch ->
-				io:format("ERROR: nomatch decode result~n~p~n", [Nomatch]),
-				{noreply, State}
+			#{status := ok, result := Msg} ->
+				String = map_to_string(Msg),
+				lager:debug("decode result:~s", [String]),
+				{noreply, NewState};
+			_ ->
+				String = map_to_string(NewState),
+				lager:debug("nomatch decode result:~s", [String]),
+				{noreply, NewState}
 		end
 	catch
 		Type:Reason ->
@@ -153,21 +161,33 @@ code_change(_OldVsn, State, _Extra) ->
 
 decode(#{buf := <<>>} = State) ->
 	State;
+
 decode(#{status := ok} = State) ->
-	decode(State#{status => event});
+	decode(State#{status => key});
 
-decode(#{status := event, buf := <<"/", Buf/binary>>} = State) ->
-	decode(State#{status => key, buf => Buf});
-decode(#{status := event, buf := <<C:8, Buf/binary>>, msg := #{event := Event} = Msg} = State) ->
-	decode(State#{msg => Msg#{event => <<Event/binary, C>>}, buf => Buf});
-
-decode(#{status := key_r, buf := <<"\n", Buf/binary>>, msg := Msg} = State) ->
-	State#{status => ok, buf => Buf, result => Msg, msg => #{event => <<>>, params => undefined}};
-
-decode(#{status := key, buf := <<"\r", Buf/binary>>, key := Key, msg := Msg} = State) ->
-	decode(State#{status => key_r, buf => Buf, key := <<>>, msg => Msg#{params => Key}});
+decode(#{status := key, buf := <<"\n", Buf/binary>>, list := List} = State) ->
+	State#{status => ok, buf => Buf, result => maps:from_list(lists:reverse(List)), list => []};
+decode(#{status := key, buf := <<"/", Buf/binary>>} = State) ->
+	decode(State#{status => value, buf => Buf});
 decode(#{status := key, buf := <<C:8, Buf/binary>>, key := Key} = State) ->
 	decode(State#{key => <<Key/binary, C>>, buf => Buf});
 
+decode(#{status := value, buf := <<"\r", Buf/binary>>, key := <<"Asterisk Call Manager">>, value := Value, list := []} = State) ->
+	decode(State#{status => key, buf => Buf, key => <<>>, value => <<>>, list => [{<<"Version">>, Value}, {<<"Service">>, <<"Asterisk Call Manager">>}, {<<"Event">>, <<"SuccessfulConnect">>}]});
+decode(#{status := value, buf := <<"\r", Buf/binary>>, key := Key, value := Value, list := List} = State) ->
+	decode(State#{status => key, buf => Buf, key => <<>>, value => <<>>, list => [{Key, Value} | List]});
+decode(#{status := value, buf := <<C:8, Buf/binary>>, value := Value} = State) ->
+	decode(State#{value => <<Value/binary, C>>, buf => Buf});
+
 decode(State) when (erlang:is_map(State)) ->
 	State#{status => error}.
+
+%%--------------------------------------------------------------------
+
+map_to_string(M) when erlang:is_map(M) ->
+	maps:fold(
+		fun(K, V, A) ->
+			io_lib:format("~s~n~p: ~p", [A, K, V])
+		end, "", M);
+map_to_string(V) ->
+	io_lib:format("~p", [V]).
