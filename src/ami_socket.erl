@@ -13,7 +13,7 @@
 
 %% API functions
 
--export([start/0, start_link/0, stop/0, connect/4, send/1]).
+-export([start/0, start_link/0, stop/0, connect/2, connect/4, send/1]).
 
 %% gen_server callbacks
 
@@ -31,6 +31,9 @@ start_link() ->
 
 stop() ->
 	gen_server:call(?MODULE, stop).
+
+connect(Host, Port) ->
+	gen_server:call(?MODULE, {connect, Host, Port}).
 
 connect(Host, Port, Username, Secret) ->
 	gen_server:call(?MODULE, {connect, Host, Port, Username, Secret}).
@@ -198,7 +201,7 @@ decode(#{status := value, buf := <<C:8, Buf/binary>>, value := Value} = State) -
 decode(State) when (erlang:is_map(State)) ->
 	State#{status => error}.
 
-
+%%--------------------------------------------------------------------
 
 encode(Msg) ->
 	Data = maps:fold(
