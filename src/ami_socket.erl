@@ -13,7 +13,7 @@
 
 %% API functions
 
--export([start/0, start_link/0, stop/0, connect/2, connect/4, send/1]).
+-export([start/0, start_link/0, stop/0, connect/3, send/1]).
 
 %% gen_server callbacks
 
@@ -32,11 +32,8 @@ start_link() ->
 stop() ->
 	gen_server:call(?MODULE, stop).
 
-connect(Host, Port) ->
-	gen_server:call(?MODULE, {connect, Host, Port}).
-
-connect(Host, Port, Username, Secret) ->
-	gen_server:call(?MODULE, {connect, Host, Port, Username, Secret}).
+connect(Host, Port, Event) ->
+	gen_server:call(?MODULE, {connect, Host, Port, Event}).
 
 send(Msg) ->
 	gen_server:cast(?MODULE, {send, self(), Msg}).
@@ -53,10 +50,7 @@ send(Msg) ->
 init([]) ->
 	lager:debug("init"),
 	{ok, #{
-		host     => undefined,
-		port     => undefined,
-		username => undefined,
-		secret   => undefined,
+		event    => undefined,
 		socket   => undefined,
 		status   => ok,
 		key      => <<>>,
@@ -73,16 +67,15 @@ init(Args) ->
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
 
-handle_call({connect, Host, Port, Username, Secret}, _From, State) ->
+handle_call({connect, Host, Port, Event}, _From, State) ->
 	case gen_tcp:connect(Host, Port, [binary, {active, true}, {nodelay, true}]) of
 		{ok, Socket} ->
 			lager:debug("connect to ~p:~p success: ~p", [Host, Port, Socket]),
-			{reply, ok, State#{host => Host, port => Port, socket => Socket, username => Username, secret => Secret}};
+			{reply, ok, State#{event => Event, socket => Socket}};
 		{error, Reason} ->
 			lager:error("connect error:~n~p", [Reason]),
 			{stop, {error, Reason}, {error, Reason}, State}
 	end;
-
 
 %% Handling stop message
 handle_call(stop, _From, State) ->
@@ -99,7 +92,7 @@ handle_call(Request, From, State) ->
 
 handle_cast({send, ReplyTo, #{<<"ActionID">> := ActionID} = Msg}, #{socket := Socket} = State) ->
 	Data = encode(Msg),
-	lager:debug("send data:~n~p", [Data]),
+	% lager:debug("send data:~n~p", [Data]),
 	case gen_tcp:send(Socket, Data) of
 		ok ->
 			lager:debug("send message by id ~p; reply to ~p", [ActionID, ReplyTo]),
@@ -117,23 +110,16 @@ handle_cast(Message, State) ->
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
 
-handle_info({tcp, Socket, Data}, #{socket := Socket, buf := Buf} = State)->
+handle_info({tcp, Socket, Data}, #{event := Event, socket := Socket, buf := Buf} = State)->
 	try
 		% lager:debug("recieve tcp data:~n~p", [Data]),
 		NewState = decode(State#{buf => <<Buf/binary, Data/binary>>}),
 		case NewState of
-			#{status := ok, result := #{<<"Event">> := <<"SuccessfulConnect">>} = Map, username := Username, secret := Secret} ->
-				String = map_to_string(Map),
-				lager:debug("~s", [String]),
-				ami:login(Username, Secret),
-				{noreply, NewState};
 			#{status := ok, result := Msg} ->
-				String = map_to_string(Msg),
-				lager:debug("decode result:~s", [String]),
+				gen_event:notify(Event, {ami, Msg}),
 				{noreply, NewState};
 			_ ->
-				% String = map_to_string(NewState),
-				% lager:debug("nomatch decode result:~s", [String]),
+				% lager:debug("nomatch decode result:~s", [map_to_string(NewState)]),
 				{noreply, NewState}
 		end
 	catch

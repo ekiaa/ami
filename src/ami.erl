@@ -9,8 +9,8 @@
 
 -export([
 	%% API functions
-	connect/2,
-	connect/4,
+	connect/3,
+	connect/5,
 	%% AMI Actions
 	login/2
 ]).
@@ -19,11 +19,11 @@
 %%% API functions
 %%%-------------------------------------------------------------------
 
-connect(Host, Port) ->
-	ami_socket:connect(Host, Port).
+connect(Host, Port, Event) ->
+	ami_socket:connect(Host, Port, Event).
 
-connect(Host, Port, Username, Secret) ->
-	ami_socket:connect(Host, Port, Username, Secret).
+connect(Host, Port, Username, Secret, Event) ->
+	ami_socket:connect(Host, Port, Username, Secret, Event).
 
 %%%-------------------------------------------------------------------
 %%% AMI Actions
