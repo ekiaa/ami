@@ -9,34 +9,30 @@
 
 -export([
 	%% API functions
-	connect/3,
-	connect/5,
+	create/5,
 	%% AMI Actions
-	login/2
+	login/3
 ]).
 
 %%%-------------------------------------------------------------------
 %%% API functions
 %%%-------------------------------------------------------------------
 
-connect(Host, Port, Event) ->
-	ami_socket:connect(Host, Port, Event).
-
-connect(Host, Port, Username, Secret, Event) ->
-	ami_socket:connect(Host, Port, Username, Secret, Event).
+create(Event, Host, Port, Username, Secret) ->
+	ami_socket:start(Event, Host, Port, Username, Secret).
 
 %%%-------------------------------------------------------------------
 %%% AMI Actions
 %%%-------------------------------------------------------------------
 
-login(Username, Secret) ->
+login(AMI, Username, Secret) ->
 	ActionID = get_action_id(),
 	Msg = #{
 		<<"Action">>   => <<"Login">>,
 		<<"ActionID">> => ActionID,
 		<<"Username">> => Username,
 		<<"Secret">>   => Secret},
-	ami_socket:send(Msg),
+	ami_socket:send(AMI, Msg),
 	ActionID.
 
 %%%-------------------------------------------------------------------

@@ -13,7 +13,7 @@
 
 %% API functions
 
--export([start/0, start_link/0, stop/0, connect/3, send/1]).
+-export([start/5, start_link/5, send/2]).
 
 %% gen_server callbacks
 
@@ -23,20 +23,14 @@
 %% API functions
 %%====================================================================
 
-start() ->
-	?MODULE:start_link().
+start(Event, Host, Port, Username, Secret) ->
+	ami_socket_sup:start_child([Event, Host, Port, Username, Secret]).
 
-start_link() ->
-	gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+start_link(Event, Host, Port, Username, Secret) ->
+	gen_server:start_link(?MODULE, {create, Event, Host, Port, Username, Secret}, []).
 
-stop() ->
-	gen_server:call(?MODULE, stop).
-
-connect(Host, Port, Event) ->
-	gen_server:call(?MODULE, {connect, Host, Port, Event}).
-
-send(Msg) ->
-	gen_server:cast(?MODULE, {send, self(), Msg}).
+send(AMI, Msg) ->
+	gen_server:cast(AMI, {send, self(), Msg}).
 
 
 %%====================================================================
@@ -47,10 +41,10 @@ send(Msg) ->
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
 
-init([]) ->
-	lager:debug("init"),
+init({create, Event, Host, Port, Username, Secret}) ->
+	gen_server:cast(self(), {connect, Host, Port, Username, Secret}),
 	{ok, #{
-		event    => undefined,
+		event    => Event,
 		socket   => undefined,
 		status   => ok,
 		key      => <<>>,
@@ -67,21 +61,6 @@ init(Args) ->
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
 
-handle_call({connect, Host, Port, Event}, _From, State) ->
-	case gen_tcp:connect(Host, Port, [binary, {active, true}, {nodelay, true}]) of
-		{ok, Socket} ->
-			lager:debug("connect to ~p:~p success: ~p", [Host, Port, Socket]),
-			{reply, ok, State#{event => Event, socket => Socket}};
-		{error, Reason} ->
-			lager:error("connect error:~n~p", [Reason]),
-			{stop, {error, Reason}, {error, Reason}, State}
-	end;
-
-%% Handling stop message
-handle_call(stop, _From, State) ->
-	lager:debug("handle_call: stop"),
-	{stop, normal, State};
-
 handle_call(Request, From, State) ->
 	lager:error("handle_call: nomatch Request: ~p; From ~p ", [Request, From]),
 	{stop, {error, nomatch}, {error, nomatch}, State}.
@@ -89,6 +68,17 @@ handle_call(Request, From, State) ->
 %%--------------------------------------------------------------------
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
+
+handle_cast({connect, Host, Port, Username, Secret}, State) ->
+	case gen_tcp:connect(Host, Port, [binary, {active, true}, {nodelay, true}]) of
+		{ok, Socket} ->
+			lager:debug("connect to ~p:~p success: ~p", [Host, Port, Socket]),
+			ami:login(self(), Username, Secret),
+			{noreply, State#{socket => Socket}};
+		{error, Reason} ->
+			lager:error("connect error:~n~p", [Reason]),
+			{stop, {error, Reason}, State}
+	end;
 
 handle_cast({send, ReplyTo, #{<<"ActionID">> := ActionID} = Msg}, #{socket := Socket} = State) ->
 	Data = encode(Msg),
@@ -111,30 +101,28 @@ handle_cast(Message, State) ->
 %%--------------------------------------------------------------------
 
 handle_info({tcp, Socket, Data}, #{event := Event, socket := Socket, buf := Buf} = State)->
-	try
-		% lager:debug("recieve tcp data:~n~p", [Data]),
-		NewState = decode(State#{buf => <<Buf/binary, Data/binary>>}),
-		case NewState of
-			#{status := ok, result := Msg} ->
-				gen_event:notify(Event, {ami, Msg}),
-				{noreply, NewState};
-			_ ->
-				% lager:debug("nomatch decode result:~s", [map_to_string(NewState)]),
-				{noreply, NewState}
-		end
-	catch
-		Type:Reason ->
-			lager:error("ERROR: ~p~n~p", [Type, Reason]),
-			{noreply, State}
+	% lager:debug("recieve tcp data:~n~p", [Data]),
+	NewState = decode(State#{buf => <<Buf/binary, Data/binary>>}),
+	case NewState of
+		#{status := ok, result := undefined} ->
+			{noreply, NewState};
+		#{status := ok, result := Msg} ->
+			gen_event:notify(Event, {ami_event, self(), Msg}),
+			{noreply, NewState};
+		#{status := error} ->
+			{stop, {error, nomatch}, NewState};
+		_ ->
+			% lager:debug("nomatch decode result:~s", [map_to_string(NewState)]),
+			{noreply, NewState}
 	end;
 
 handle_info({tcp_closed, Socket}, #{socket := Socket} = State)  ->
 	lager:debug("socket ~p closed", [Socket]),
-	{noreply, State#{socket => undefined}};
+	{stop, normal, State};
 
 handle_info(Info, State) ->
 	lager:error("handle_info: nomatch Info: ~p", [Info]),
-	{noreply, State}.
+	{stop, {error, nomatch}, State}.
 
 %%--------------------------------------------------------------------
 %% Function: terminate(Reason, State) -> void()
@@ -176,9 +164,8 @@ decode(#{status := key, buf := <<C:8, Buf/binary>>, key := Key} = State) ->
 decode(#{status := delim, buf := <<" ", Buf/binary>>} = State) ->
 	decode(State#{status => value, buf => Buf});
 
-decode(#{status := value, buf := <<"\n", Buf/binary>>, key := <<"Asterisk Call Manager">>, value := Value, list := []} = State) ->
-	List = [{<<"Event">>, <<"SuccessfulConnect">>}, {<<"Service">>, <<"Asterisk Call Manager">>}, {<<"Version">>, Value}],
-	State#{status => ok, buf => Buf, key => <<>>, value => <<>>, result => maps:from_list(List)};
+decode(#{status := value, buf := <<"\n", Buf/binary>>, key := <<"Asterisk Call Manager">>, value := _Value, list := []} = State) ->
+	State#{status => ok, buf => Buf, key => <<>>, value => <<>>, result => undefined};
 decode(#{status := value, buf := <<"\n", Buf/binary>>, key := Key, value := Value, list := List} = State) ->
 	decode(State#{status => key, buf => Buf, key => <<>>, value => <<>>, list => [{Key, Value} | List]});
 decode(#{status := value, buf := <<C:8, Buf/binary>>, value := Value} = State) ->
