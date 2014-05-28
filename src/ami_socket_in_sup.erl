@@ -1,4 +1,4 @@
--module(ami_socket_sup).
+-module(ami_socket_in_sup).
 
 -behaviour(supervisor).
 
@@ -24,5 +24,5 @@ start_child(Args) ->
 
 init([]) ->
 	{ok, {{simple_one_for_one, 0, 1}, [
-		{ami_socket, {ami_socket, start_link, []}, temporary, 1000, worker, [ami_socket]}]}}.
+		{ami_socket_in, {ami_socket_in, start_link, []}, temporary, 1000, worker, [ami_socket_in]}]}}.
 

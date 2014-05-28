@@ -1,11 +1,11 @@
 %%%-------------------------------------------------------------------
-%%% File        : ami_socket.erl
+%%% File        : ami_socket_out.erl
 %%% Author      : Artem Ekimov <ekimov-artem@ya.ru>
 %%% Description : 
 %%% Created     : 27.01.2014
 %%%-------------------------------------------------------------------
 
--module(ami_socket).
+-module(ami_socket_out).
 
 -behaviour(gen_server).
 
@@ -24,7 +24,7 @@
 %%====================================================================
 
 start(Event, Host, Port, Username, Secret) ->
-	ami_socket_sup:start_child([Event, Host, Port, Username, Secret]).
+	ami_socket_out_sup:start_child([Event, Host, Port, Username, Secret]).
 
 start_link(Event, Host, Port, Username, Secret) ->
 	gen_server:start_link(?MODULE, {create, Event, Host, Port, Username, Secret}, []).
@@ -38,7 +38,7 @@ send(AMI, Message, ReplyTo) ->
 			ActionID = get_action_id(),
 			case ReplyTo of
 				undefined ->
-					gen_server:call(AMI, {send, maps:put(<<"ActionID">>, ActionID, Message)});
+					gen_server:call(AMI, {send, maps:put(<<"ActionID">>, ActionID, Message)}, infinity);
 				_ ->
 					gen_server:cast(AMI, {send, maps:put(<<"ActionID">>, ActionID, Message), ReplyTo}),
 					{ok, ActionID}
@@ -59,6 +59,7 @@ send(AMI, Message, ReplyTo) ->
 init({create, Event, Host, Port, Username, Secret}) ->
 	gen_server:cast(self(), {connect, Host, Port, Username, Secret}),
 	{ok, #{
+		in       => undefined,
 		event    => Event,
 		socket   => undefined,
 		status   => ok,
@@ -82,7 +83,7 @@ handle_call({send, #{<<"ActionID">> := ActionID} = Msg}, Client, #{socket := Soc
 	Data = encode(Msg),
 	case gen_tcp:send(Socket, Data) of
 		ok ->
-			lager:debug("send message by id ~p; reply to ~p", [ActionID, Client]),
+			% lager:debug("send message by id ~p; reply to ~p", [ActionID, Client]),
 			{noreply, State#{replyto => maps:put(ActionID, {reply, Client}, ReplyToList)}};
 		{error, Reason} ->
 			lager:error("send message error:~n~p", [Reason]),
@@ -97,11 +98,35 @@ handle_call(Request, From, State) ->
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
 
+handle_cast({decode, Message}, #{event := EventMgr, replyto := ReplyToList} = State) ->
+	case Message of
+		{event, Event} ->
+			gen_event:notify(EventMgr, {ami_event, self(), Event}),
+			{noreply, State};
+		{response, #{<<"ActionID">> := ActionID} = Response} ->
+			case maps:find(ActionID, ReplyToList) of
+				{ok, {reply, Client}} ->
+					gen_server:reply(Client, {ok, Response}),
+					{noreply, State#{replyto => maps:remove(ActionID, ReplyToList)}};
+				{ok, {send, Client}} ->
+					Client ! {ami_reply, self(), Response},
+					{noreply, State#{replyto => maps:remove(ActionID, ReplyToList)}};
+				error ->
+					{noreply, State}
+			end;
+		{welcome, #{<<"Asterisk Call Manager">> := Version}} ->
+			lager:debug("Asterisk Call Manager version: ~s", [Version]),
+			{noreply, State};
+		_ ->
+			lager:error("Nomatch message: ~p", [Message]),
+			{noreply, State}
+	end;
+
 handle_cast({send, #{<<"ActionID">> := ActionID} = Msg, ReplyTo}, #{socket := Socket, replyto := ReplyToList} = State) ->
 	Data = encode(Msg),
 	case gen_tcp:send(Socket, Data) of
 		ok ->
-			lager:debug("send message by id ~p; send to ~p", [ActionID, ReplyTo]),
+			% lager:debug("send message by id ~p; send to ~p", [ActionID, ReplyTo]),
 			{noreply, State#{replyto => maps:put(ActionID, {send, ReplyTo}, ReplyToList)}};
 		{error, Reason} ->
 			lager:error("send message error:~n~p", [Reason]),
@@ -111,8 +136,11 @@ handle_cast({send, #{<<"ActionID">> := ActionID} = Msg, ReplyTo}, #{socket := So
 handle_cast({connect, Host, Port, Username, Secret}, State) ->
 	case gen_tcp:connect(Host, Port, [binary, {active, true}, {nodelay, true}]) of
 		{ok, Socket} ->
-			ami:send(self(), #{<<"Action">> => <<"Login">>, <<"Username">> => Username, <<"Secret">> => Secret}, self()),
-			{noreply, State#{socket => Socket}};
+			{ok, InPid} = ami_socket_in:start(Socket, self()),
+			ok = gen_tcp:controlling_process(Socket, InPid),
+			erlang:link(InPid),
+			ami:login(self(), Username, Secret, self()),
+			{noreply, State#{in => InPid, socket => Socket}};
 		{error, Reason} ->
 			lager:error("gen_tcp:connect() error:~n~p", [Reason]),
 			{stop, {error, Reason}, State}
@@ -126,43 +154,6 @@ handle_cast(Message, State) ->
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
 
-handle_info({tcp, Socket, Data}, #{event := Event, socket := Socket, buf := Buf} = State)->
-	% lager:debug("recieve tcp data:~n~p", [Data]),
-	NewState = decode(State#{buf => <<Buf/binary, Data/binary>>}),
-	% lager:debug("decode return:~s", [map_to_string(NewState)]),
-	case NewState of
-		#{status := ok, type := greeting} ->
-			{noreply, NewState};
-		#{status := ok, type := event, result := Message} ->
-			gen_event:notify(Event, {ami_event, self(), Message}),
-			{noreply, NewState};
-		#{status := ok, type := response, result := #{<<"ActionID">> := ActionID} = Message, replyto := ReplyToList} ->
-			case maps:find(ActionID, ReplyToList) of
-				{ok, {reply, Client}} ->
-					gen_server:reply(Client, {ok, Message}),
-					lager:debug("reply to ~p response:~s", [Client, map_to_string(Message)]),
-					{noreply, NewState#{replyto => maps:remove(ActionID, ReplyToList)}};
-				{ok, {send, Client}} ->
-					Client ! {ami_reply, self(), Message},
-					lager:debug("send to ~p response:~s", [Client, map_to_string(Message)]),
-					{noreply, NewState#{replyto => maps:remove(ActionID, ReplyToList)}};
-				error ->
-					{noreply, NewState}
-			end;
-		#{status := ok} ->
-			lager:warning("nomatch decode result:~s", [map_to_string(NewState)]),
-			{noreply, NewState};
-		#{status := error} ->
-			lager:error("decode error:~s", [map_to_string(NewState)]),
-			{stop, {error, nomatch}, NewState};
-		_ ->
-			{noreply, NewState}
-	end;
-
-handle_info({tcp_closed, Socket}, #{socket := Socket} = State)  ->
-	lager:debug("socket ~p closed", [Socket]),
-	{stop, normal, State};
-
 handle_info({ami_reply, _, _}, State) ->
 	{noreply, State};
 
@@ -174,8 +165,9 @@ handle_info(Info, State) ->
 %% Function: terminate(Reason, State) -> void()
 %%--------------------------------------------------------------------
 
-terminate(_Reason, _State) ->
-	ok.
+terminate(normal, _) -> ok;
+
+terminate(Reason, State) -> lager:error("terminate reason:~n~p~nState: ~p", [Reason, State]).
 
 %%--------------------------------------------------------------------
 %% Func: code_change(OldVsn, State, Extra) -> {ok, NewState}
@@ -187,43 +179,6 @@ code_change(_OldVsn, State, _Extra) ->
 
 %%--------------------------------------------------------------------
 %%% Internal functions
-%%--------------------------------------------------------------------
-
-decode(#{buf := <<>>} = State) ->
-	State;
-
-decode(#{status := ok} = State) ->
-	decode(State#{status => key, type => undefined, result => #{}});
-
-decode(#{buf := <<"\r", Buf/binary>>} = State) ->
-	decode(State#{buf => Buf});
-
-decode(#{status := key, buf := <<"\n", Buf/binary>>} = State) ->
-	State#{status => ok, buf => Buf};
-decode(#{status := key, buf := <<"/", Buf/binary>>} = State) ->
-	decode(State#{status => value, buf => Buf});
-decode(#{status := key, buf := <<":", Buf/binary>>} = State) ->
-	decode(State#{status => delim, buf => Buf});
-decode(#{status := key, buf := <<C:8, Buf/binary>>, key := Key} = State) ->
-	decode(State#{key => <<Key/binary, C>>, buf => Buf});
-
-decode(#{status := delim, key := Key, buf := <<" ", Buf/binary>>} = State) ->
-	case Key of
-		<<"Event">>    -> decode(State#{status => value, buf => Buf, type => event});
-		<<"ActionID">> -> decode(State#{status => value, buf => Buf, type => response});
-		_ -> decode(State#{status => value, buf => Buf})
-	end;
-
-decode(#{status := value, buf := <<"\n", Buf/binary>>, key := <<"Asterisk Call Manager">>, value := _Value} = State) ->
-	State#{status => ok, buf => Buf, key => <<>>, value => <<>>, type => greeting};
-decode(#{status := value, buf := <<"\n", Buf/binary>>, key := Key, value := Value, result := Result} = State) ->
-	decode(State#{status => key, buf => Buf, key => <<>>, value => <<>>, result => maps:put(Key, Value, Result)});
-decode(#{status := value, buf := <<C:8, Buf/binary>>, value := Value} = State) ->
-	decode(State#{value => <<Value/binary, C>>, buf => Buf});
-
-decode(State) when (erlang:is_map(State)) ->
-	State#{status => error}.
-
 %%--------------------------------------------------------------------
 
 encode(Msg) ->
@@ -253,18 +208,18 @@ get_action_id() ->
 	{A1, A2, A3} = erlang:now(),
 	erlang:list_to_binary(io_lib:format("~w~w~w", [A1, A2, A3])).
 
-map_to_string(M) when erlang:is_map(M) ->
-	maps:fold(
-		fun
-			(K, V, A) when erlang:is_binary(K), erlang:is_binary(V) -> 
-				io_lib:format("~s~n~s: ~s", [A, erlang:binary_to_list(K), erlang:binary_to_list(V)]);
-			(K, V, A) when erlang:is_map(V) ->
-				io_lib:format("~s~n~p: ~s", [A, K, map_to_string(V)]);
-			(K, V, A) ->
-				io_lib:format("~s~n~p: ~p", [A, K, V])
-		end, "", M);
-map_to_string(V) ->
-	io_lib:format("~p", [V]).
+% map_to_string(M) when erlang:is_map(M) ->
+% 	maps:fold(
+% 		fun
+% 			(K, V, A) when erlang:is_binary(K), erlang:is_binary(V) -> 
+% 				io_lib:format("~s~n~s: ~s", [A, erlang:binary_to_list(K), erlang:binary_to_list(V)]);
+% 			(K, V, A) when erlang:is_map(V) ->
+% 				io_lib:format("~s~n~p: ~s", [A, K, map_to_string(V)]);
+% 			(K, V, A) ->
+% 				io_lib:format("~s~n~p: ~p", [A, K, V])
+% 		end, "", M);
+% map_to_string(V) ->
+% 	io_lib:format("~p", [V]).
 
 to_bin(Bin) when erlang:is_binary(Bin) -> Bin;
 to_bin(Val) -> erlang:list_to_binary(io_lib:format("~p", [Val])).
